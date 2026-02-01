@@ -1,55 +1,46 @@
 # build_public_pages.py
-import sys
+"""
+Flexible static site builder for AI Visibility knowledge-base repos.
+
+Goals
+- Always produce the full set of HTML pages (even if data folders are empty/missing).
+- Support BOTH canonical folder structure (schemas/*) AND legacy/custom folder names
+  (e.g. faq-schemas/, locations/, organization/, llm-data/).
+- Never crash the workflow just because a folder is missing.
+"""
+
 import os
-import yaml
+import sys
 import json
+import yaml
 import re
 from datetime import datetime
+from urllib.parse import quote_plus
 
-# =========================
+# -------------------------
 # Utilities
-# =========================
+# -------------------------
 def escape_html(text):
     if not isinstance(text, str):
         return ""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
 
 def slugify(text):
-    """Generate URL-friendly slug from text"""
     if not text:
         return "item"
-    text = re.sub(r'[^a-zA-Z0-9\s-]', '', str(text))
-    text = re.sub(r'[\s]+', '-', text.strip().lower())
+    text = re.sub(r"[^a-zA-Z0-9\s-]", "", str(text))
+    text = re.sub(r"[\s]+", "-", text.strip().lower())
     return text or "item"
-
-def load_data(filepath):
-    if not filepath or not os.path.exists(filepath):
-        if filepath:
-            print(f"🔍 File not found: {filepath}")
-        return []
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-            if not content:
-                print(f"⚠️ File is empty: {filepath}")
-                return []
-            if filepath.endswith(('.yaml', '.yml')):
-                data = yaml.safe_load(content) or []
-                return data if isinstance(data, list) else [data]
-            elif filepath.endswith('.json'):
-                data = json.loads(content) or []
-                return data if isinstance(data, list) else [data]
-    except Exception as e:
-        print(f"❌ Failed to load {filepath}: {e}")
-        return []
-    print(f"⚠️ Unsupported file type: {filepath}")
-    return []
 
 def _first_nonempty(*vals):
     for v in vals:
         if isinstance(v, str) and v.strip():
             return v.strip()
-        if isinstance(v, (int, float)):  # allow numeric fields (e.g., postal code)
+        if isinstance(v, (int, float)) and v == v:
             return str(v)
         if isinstance(v, dict) and "@value" in v and isinstance(v["@value"], str) and v["@value"].strip():
             return v["@value"].strip()
@@ -64,6 +55,45 @@ def _as_list(val):
         return [s.strip() for s in val.split(",") if s.strip()]
     return []
 
+def load_data(filepath):
+    """Load JSON/YAML from common schema files.
+
+    Supports: .json, .yaml, .yml, and also .txt/.md/.llm when the content is JSON or YAML.
+    Returns a list of records (always a list).
+    """
+    if not filepath or not os.path.exists(filepath):
+        return []
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            return []
+
+        lower = filepath.lower()
+        # Primary by extension
+        if lower.endswith((".json", ".jsonld")):
+            data = json.loads(content) or []
+            return data if isinstance(data, list) else [data]
+
+        if lower.endswith((".yaml", ".yml")):
+            data = yaml.safe_load(content) or []
+            return data if isinstance(data, list) else [data]
+
+        # Fallback: allow text/markdown/llm files that actually contain JSON or YAML
+        if lower.endswith((".txt", ".md", ".llm")):
+            stripped = content.lstrip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                data = json.loads(content) or []
+                return data if isinstance(data, list) else [data]
+            # Try YAML as a last resort (lots of people paste YAML into .txt)
+            data = yaml.safe_load(content) or []
+            return data if isinstance(data, list) else [data]
+
+    except Exception as e:
+        print(f"❌ Failed to load {filepath}: {e}")
+        return []
+    return []
+
 def _title_from_filename(path):
     base = os.path.splitext(os.path.basename(path))[0]
     return base.replace("-", " ").replace("_", " ").strip().title()
@@ -72,10 +102,7 @@ def _is_placeholder_title(text):
     if not isinstance(text, str) or not text.strip():
         return True
     t = text.strip().lower()
-    return (
-        t in {"service", "unnamed service", "untitled", "n/a", "na", "tbd"}
-        or bool(re.fullmatch(r"(service|item|entry)\s*\d+", t))
-    )
+    return t in {"service", "unnamed service", "untitled", "n/a", "na", "tbd"} or bool(re.fullmatch(r"(service|item|entry)\s*\d+", t))
 
 def _guess_description(obj):
     return _first_nonempty(
@@ -99,7 +126,6 @@ def _guess_price(obj):
     ) or "Contact for pricing"
 
 def _bullet_points(obj):
-    """Try to produce a few crisp bullets from common fields."""
     feats = _as_list(obj.get("features") or obj.get("benefits") or obj.get("highlights"))
     specs = _as_list(obj.get("specialties") or obj.get("capabilities"))
     areas = _as_list(obj.get("service_areas") or obj.get("areas") or obj.get("locations_served"))
@@ -111,214 +137,85 @@ def _bullet_points(obj):
             bullets.append(s)
     if areas:
         bullets.append("Service areas: " + ", ".join(areas[:5]))
-    # de-dupe while preserving order
+    # de-dupe
     seen = set()
     uniq = []
     for b in bullets:
-        if b.lower() not in seen:
+        key = b.lower()
+        if key not in seen:
             uniq.append(b)
-            seen.add(b.lower())
+            seen.add(key)
     return uniq[:4]
 
-# =========================
-# Normalization helpers for Contact data
-# =========================
-FIELD_ALIASES = {
-    "entity_name": ["entity_name", "organization", "org_name", "company", "name"],
-    "contact_person": ["contact_person", "contact", "contact_name", "primary_contact", "attention"],
-    "email": ["email", "contact_email", "email_address", "mail"],
-    "phone": ["phone", "telephone", "tel", "phone_number", "contact_number"],
-    "address_street": ["address_street", "streetAddress", "street", "address1", "address_line_1", "address_line"],
-    "address_city": ["address_city", "city", "addressLocality"],
-    "address_state": ["address_state", "state", "addressRegion", "province"],
-    "address_postal_code": ["address_postal_code", "postalCode", "zip", "zipCode", "postcode"],
-    "hours": ["hours", "openingHours", "opening_hours", "business_hours"],
-    "map_embed_url": ["map_embed_url", "map", "map_iframe"],
-    "google_maps_url": ["google_maps_url", "maps_url", "map_url"],
-    "latitude": ["geo_latitude", "latitude", "lat"],
-    "longitude": ["geo_longitude", "longitude", "lng", "lon"],
-    "website": ["website", "url", "homepage"],
-    "sameAs": ["sameAs", "same_as", "social", "social_links"],
-}
-
-def _alias_get(d: dict, canon_key: str):
-    """Fetch a value by canonical key using FIELD_ALIASES (and nested geo, contactPoint)."""
-    if not isinstance(d, dict):
-        return None
-    if canon_key in d and (d[canon_key] or d[canon_key] == 0):
-        return d[canon_key]
-    for k in FIELD_ALIASES.get(canon_key, []):
-        if k in d and (d[k] or d[k] == 0):
-            return d[k]
-    if canon_key in ("latitude", "longitude"):
-        geo = d.get("geo") or {}
-        if isinstance(geo, dict):
-            if canon_key == "latitude":
-                return geo.get("latitude")
-            else:
-                return geo.get("longitude")
-    if canon_key in ("phone", "email"):
-        cp = d.get("contactPoint") or d.get("contact_point")
-        if isinstance(cp, dict):
-            if canon_key == "phone":
-                return _first_nonempty(cp.get("telephone"), cp.get("phone"))
-            else:
-                return _first_nonempty(cp.get("email"))
+# -------------------------
+# Flexible folder resolution
+# -------------------------
+def _first_existing_dir(*candidates):
+    for d in candidates:
+        if d and os.path.isdir(d):
+            return d
     return None
 
-def _format_address_from_components(loc: dict):
-    line1 = _first_nonempty(_alias_get(loc, "address_street"))
-    line2 = _first_nonempty(loc.get("address2"), loc.get("address_line_2"), loc.get("suite"))
-    city  = _first_nonempty(_alias_get(loc, "address_city"))
-    state = _first_nonempty(_alias_get(loc, "address_state"))
-    zipc  = _first_nonempty(_alias_get(loc, "address_postal_code"))
-    parts = [line1, line2, ", ".join([p for p in [city, state] if p]) if city or state else None, zipc]
-    return " ".join([p for p in parts if p]).strip()
+def _list_data_files(folder, exts=(".json", ".yaml", ".yml", ".md", ".llm", ".txt", ".jsonl")):
+    out = []
+    if not folder or not os.path.isdir(folder):
+        return out
+    for root, _, files in os.walk(folder):
+        for fn in files:
+            if fn.lower().endswith(exts):
+                out.append(os.path.join(root, fn))
+    return out
 
-def _format_address(addr, loc):
-    """Accepts string/dict or composes from components."""
-    if isinstance(addr, str) and addr.strip():
-        return addr.strip()
-    if isinstance(addr, dict):
-        line1 = _first_nonempty(addr.get("streetAddress"), addr.get("address1"), addr.get("addressLine1"))
-        line2 = _first_nonempty(addr.get("address2"), addr.get("addressLine2"), addr.get("suite"))
-        city  = _first_nonempty(addr.get("addressLocality"), addr.get("city"))
-        state = _first_nonempty(addr.get("addressRegion"), addr.get("state"))
-        zipc  = _first_nonempty(addr.get("postalCode"), addr.get("zip"), addr.get("zipCode"))
-        parts = [line1, line2, ", ".join([p for p in [city, state] if p]) if city or state else None, zipc]
-        return " ".join([p for p in parts if p]).strip()
-    return _format_address_from_components(loc)
-
-def _extract_hours(loc):
-    hours = _first_nonempty(_alias_get(loc, "hours"))
-    if hours:
-        return hours
-    spec = loc.get("openingHoursSpecification") or loc.get("opening_hours_specification")
-    if isinstance(spec, list) and spec:
-        rows = []
-        for r in spec:
-            if not isinstance(r, dict):
-                continue
-            day = _first_nonempty(r.get("dayOfWeek"), r.get("day"), r.get("weekday"))
-            if isinstance(day, list) and day:
-                day = day[0]
-            if isinstance(day, str) and "/" in day:
-                day = day.rsplit("/", 1)[-1]
-            opens  = _first_nonempty(r.get("opens"), r.get("openingTime"))
-            closes = _first_nonempty(r.get("closes"), r.get("closingTime"))
-            if day and (opens or closes):
-                rows.append(f"{day}: {opens or '—'} – {closes or '—'}")
-        if rows:
-            return "; ".join(rows)
-    return ""
-
-def _map_embed_src(loc, address):
-    lat = _alias_get(loc, "latitude")
-    lng = _alias_get(loc, "longitude")
-    if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
-        return f"https://www.google.com/maps?q={lat},{lng}&z=15&output=embed"
-    map_url = _first_nonempty(_alias_get(loc, "map_embed_url"))
-    gmaps   = _first_nonempty(_alias_get(loc, "google_maps_url"))
-    if map_url:
-        return map_url
-    if gmaps:
-        return gmaps
-    if address:
-        from urllib.parse import quote_plus
-        return f"https://www.google.com/maps?q={quote_plus(address)}&output=embed"
-    return ""
+# Canonical + legacy/custom
+ORG_DIR = _first_existing_dir("schemas/organization", "schemas/organizations", "schemas/company", "schemas/entity", "schemas/business", "organization", "company", "business")
+SERVICES_DIR = _first_existing_dir("schemas/services", "services", "practice-areas", "practice_areas")
+REVIEWS_DIR = _first_existing_dir("schemas/reviews", "reviews", "testimonials")
+FAQ_DIR = _first_existing_dir("schemas/faqs", "faqs", "faq-schemas", "faq_schemas")
+HELP_DIR = _first_existing_dir("schemas/help-articles", "help-articles", "help_articles", os.path.join("llm-data", "help-articles"), os.path.join("llm-data", "help_articles"))
+LOCATIONS_DIR = _first_existing_dir("schemas/locations", "locations", "offices", "office-locations", "office_locations")
+TEAM_DIR = _first_existing_dir("schemas/team", "team", "staff", "providers", "lawyers", "attorneys")
+PRESS_DIR = _first_existing_dir("schemas/press", "press", "media", "news")
+CASE_STUDIES_DIR = _first_existing_dir("schemas/case-studies", "case-studies", "case_studies", "results", "matters")
+LLM_DATA_DIR = _first_existing_dir("llm-data", "llm_data", "llm", "data")
 
 def _normalize_records(payload):
-    """Support {locations:[...]}, [ ... ], or single object."""
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
         if isinstance(payload.get("locations"), list):
             return payload["locations"]
+        if isinstance(payload.get("services"), list):
+            return payload["services"]
+        if isinstance(payload.get("faqs"), list):
+            return payload["faqs"]
         return [payload]
     return []
 
-# =========================
-# Branding / meta driven by entity_name
-# =========================
-def _load_first_yaml_json(path_glob):
-    import glob
-    for p in glob.glob(path_glob):
-        if os.path.isfile(p) and p.lower().endswith((".json", ".yaml", ".yml")):
-            data = load_data(p)
-            if data:
-                return data[0] if isinstance(data, list) else data
-    return None
-
-def _discover_entity_name_from_other_schemas():
-    probes = [
-        "schemas/organization/*.*",
-        "schemas/organizations/*.*",
-        "schemas/company/*.*",
-        "schemas/entity/*.*",
-        "schemas/business/*.*",
-        "schemas/reviews/*.*",
-        "schemas/services/*.*",
-        "schemas/locations/*.*",
-    ]
-    for pat in probes:
-        obj = _load_first_yaml_json(pat)
-        if not obj or not isinstance(obj, dict):
-            continue
-        candidate = _first_nonempty(
-            obj.get("entity_name"),
-            obj.get("name"),
-            obj.get("legal_name"),
-            obj.get("brand"),
-            obj.get("company"),
-            obj.get("organization"),
-            obj.get("site_title"),
-        )
-        if candidate:
-            return candidate
-    return None
-
+# -------------------------
+# Organization meta
+# -------------------------
 def load_org_meta():
     """
-    Returns a dict with site-level branding pulled from schemas.
-    {
-      "name": <entity_name/name/etc>,
-      "favicon": <path or url or None>,
-      "logo": <path or url or None>
-    }
+    Returns site-level branding pulled from organization schema.
+    Falls back to repo name if missing.
     """
-    meta = {"name": None, "favicon": None, "logo": None}
-    candidate_dirs = [
-        "schemas/organization", "schemas/organizations",
-        "schemas/company", "schemas/entity", "schemas/business",
-    ]
-    import glob
-    org_file = None
-    for d in candidate_dirs:
-        if os.path.isdir(d):
-            cand = [p for p in glob.glob(os.path.join(d, "*.*")) if p.lower().endswith((".json",".yaml",".yml"))]
-            if cand:
-                org_file = cand[0]
-                break
+    meta = {"name": None, "favicon": None, "logo": None, "website": None}
 
-    org = None
-    if org_file:
-        data = load_data(org_file)
-        org = data[0] if isinstance(data, list) else data
+    # Try to load first org file
+    org_obj = None
+    if ORG_DIR:
+        for fn in sorted(os.listdir(ORG_DIR)):
+            if fn.lower().endswith((".json", ".yaml", ".yml")):
+                data = load_data(os.path.join(ORG_DIR, fn))
+                if data:
+                    org_obj = data[0] if isinstance(data, list) else data
+                    break
 
-    if isinstance(org, dict):
-        meta["name"] = _first_nonempty(
-            org.get("entity_name"),
-            org.get("name"),
-            org.get("legal_name"),
-            org.get("brand"),
-            org.get("site_title"),
-        )
-        meta["logo"] = _first_nonempty(org.get("logo_url"), org.get("logo"))
-        meta["favicon"] = _first_nonempty(org.get("favicon"), org.get("favicon_url"))
-
-    if not meta["name"]:
-        meta["name"] = _discover_entity_name_from_other_schemas()
+    if isinstance(org_obj, dict):
+        meta["name"] = _first_nonempty(org_obj.get("entity_name"), org_obj.get("name"), org_obj.get("legal_name"), org_obj.get("brand"), org_obj.get("site_title"))
+        meta["logo"] = _first_nonempty(org_obj.get("logo_url"), org_obj.get("logo"))
+        meta["favicon"] = _first_nonempty(org_obj.get("favicon"), org_obj.get("favicon_url"))
+        meta["website"] = _first_nonempty(org_obj.get("website"), org_obj.get("url"))
 
     if not meta["name"]:
         repo_slug = os.getenv("GITHUB_REPOSITORY") or ""
@@ -326,9 +223,9 @@ def load_org_meta():
 
     return meta
 
-# =========================
+# -------------------------
 # HTML shell
-# =========================
+# -------------------------
 def generate_nav():
     return """
     <nav style="background: #2c3e50; padding: 1rem; margin-bottom: 2rem;">
@@ -336,6 +233,7 @@ def generate_nav():
             <li><a href="index.html" style="color: white; text-decoration: none;">Home</a></li>
             <li><a href="about.html" style="color: white; text-decoration: none;">About</a></li>
             <li><a href="services.html" style="color: white; text-decoration: none;">Services</a></li>
+            <li><a href="awards.html" style="color: white; text-decoration: none;">Awards</a></li>
             <li><a href="testimonials.html" style="color: white; text-decoration: none;">Testimonials</a></li>
             <li><a href="faqs.html" style="color: white; text-decoration: none;">FAQs</a></li>
             <li><a href="help.html" style="color: white; text-decoration: none;">Help</a></li>
@@ -345,7 +243,6 @@ def generate_nav():
     """
 
 def generate_page(title, content):
-    # Entity-driven branding for <title> and favicon
     org = load_org_meta()
     site_name = org.get("name") or "Site"
     page_title = f"{escape_html(site_name)} — {escape_html(title)}" if title else escape_html(site_name)
@@ -374,6 +271,8 @@ def generate_page(title, content):
         .page-header {{ background: #ecf0f1; padding: 2rem; border-radius: 8px; margin-bottom: 2rem; text-align: center; }}
         .card {{ border: 1px solid #eee; padding: 1.5rem; border-radius: 8px; margin: 2rem 0; }}
         .badge {{ background: #3498db; color: white; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.9em; }}
+        .muted {{ color: #6b7280; }}
+        code {{ background: #f3f4f6; padding: 0.1rem 0.25rem; border-radius: 4px; }}
     </style>
 </head>
 <body>
@@ -388,57 +287,261 @@ def generate_page(title, content):
 </body>
 </html>"""
 
+def placeholder(title, reason):
+    return f"""
+    <div class="card">
+        <h2>{escape_html(title)}</h2>
+        <p class="muted">{escape_html(reason)}</p>
+    </div>
+    """
 
-
-def _write_placeholder_page(filename: str, title: str, message: str) -> bool:
-    """Always create the page file so downstream git steps don't fail."""
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(generate_page(title, f"<p>{escape_html(message)}</p>"))
-        print(f"ℹ️  {filename} generated with placeholder content")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to write placeholder {filename}: {e}")
-        return False
-
-
-# =========================
+# -------------------------
 # Pages
-# =========================
+# -------------------------
+def generate_index_page():
+    org = load_org_meta()
+    site_name = org.get("name") or "Site"
+
+    links = [
+        ("About Us", "about.html"),
+        ("Our Services", "services.html"),
+        ("Testimonials", "testimonials.html"),
+        ("FAQs", "faqs.html"),
+        ("Help Center", "help.html"),
+        ("Contact Us", "contact.html"),
+        ("Browse All Files", "#files"),
+    ]
+    quick_links = "\n".join(
+        f'<li style="margin: 0.5rem 0;"><a href="{url}" style="font-size: 1.1em; font-weight: 500;">{escape_html(name)}</a></li>'
+        for name, url in links
+    )
+
+    # List machine-readable files from whichever roots exist.
+    roots = [p for p in ["schemas", "faq-schemas", "organization", "locations", "llm-data"] if os.path.isdir(p)]
+    file_links = []
+    repo_slug = os.getenv("GITHUB_REPOSITORY") or ""
+    base_url = f"https://raw.githubusercontent.com/{repo_slug}/main" if repo_slug else ""
+
+    for root in roots:
+        for fp in _list_data_files(root, exts=(".json", ".yaml", ".yml", ".md", ".llm", ".txt", ".jsonl")):
+            rel = fp.replace("\\", "/")
+            display_path = rel
+            if rel.startswith("schemas/"):
+                display_path = rel.replace("schemas/", "")
+            href = f"{base_url}/{rel}" if base_url else rel
+            file_links.append(f'<li><a href="{href}" target="_blank">{escape_html(display_path)}</a></li>')
+
+    content = f"""
+    <p>Welcome to our AI-optimized public data hub. Use the quick navigation below, or browse all machine-readable files.</p>
+    <h2>🚀 Quick Navigation</h2>
+    <ul style="list-style: none; padding: 0;">
+        {quick_links}
+    </ul>
+    <h2 id="files">📁 All Files</h2>
+    <ul>
+        {''.join(sorted(file_links)) if file_links else '<li class="muted">No files found yet.</li>'}
+    </ul>
+    """
+    with open("index.html", "w", encoding="utf-8") as f:
+        f.write(generate_page(f"Welcome to {site_name}", content))
+    print("✅ index.html generated")
+    return True
+
+def generate_about_page():
+    org_obj = None
+    picked_path = None
+    if ORG_DIR:
+        for fn in sorted(os.listdir(ORG_DIR)):
+            if fn.lower().endswith((".json", ".yaml", ".yml")):
+                picked_path = os.path.join(ORG_DIR, fn)
+                data = load_data(picked_path)
+                if data:
+                    org_obj = data[0] if isinstance(data, list) else data
+                break
+
+    # Build fallbacks
+    org = org_obj if isinstance(org_obj, dict) else {}
+    org_meta = load_org_meta()
+    display_name = _first_nonempty(org.get("entity_name"), org.get("name"), org_meta.get("name")) or "About Us"
+    logo_url = _first_nonempty(org.get("logo_url"), org.get("logo"), org_meta.get("logo"))
+    desc = _first_nonempty(org.get("description"), org.get("about"))
+    if not desc:
+        desc = f"{display_name} is a professional firm serving our community with a client-first approach."
+
+    # Count services (if present)
+    service_titles = []
+    if SERVICES_DIR:
+        for fn in os.listdir(SERVICES_DIR):
+            if not fn.lower().endswith((".json", ".yaml", ".yml")):
+                continue
+            for rec in (load_data(os.path.join(SERVICES_DIR, fn)) or []):
+                for s in _normalize_records(rec):
+                    if isinstance(s, dict):
+                        t = _first_nonempty(s.get("title"), s.get("service_name"), s.get("name"))
+                        if _is_placeholder_title(t):
+                            t = None
+                        service_titles.append(t or _title_from_filename(fn))
+
+    # Locations / service areas
+    service_areas = set()
+    phone = email = ""
+    if LOCATIONS_DIR:
+        for fn in os.listdir(LOCATIONS_DIR):
+            if not fn.lower().endswith((".json", ".yaml", ".yml")):
+                continue
+            for loc in (load_data(os.path.join(LOCATIONS_DIR, fn)) or []):
+                if not isinstance(loc, dict):
+                    continue
+                for area in _as_list(loc.get("service_areas") or loc.get("areas") or loc.get("locations_served")):
+                    service_areas.add(area)
+                if not phone:
+                    phone = _first_nonempty(loc.get("phone"), loc.get("telephone"))
+                if not email:
+                    email = _first_nonempty(loc.get("email"))
+
+    # Reviews: average rating
+    ratings = []
+    if REVIEWS_DIR:
+        for fn in os.listdir(REVIEWS_DIR):
+            if not fn.lower().endswith((".json", ".yaml", ".yml")):
+                continue
+            for rev in (load_data(os.path.join(REVIEWS_DIR, fn)) or []):
+                if isinstance(rev, dict):
+                    try:
+                        r = float(rev.get("rating"))
+                        if r > 0:
+                            ratings.append(r)
+                    except Exception:
+                        pass
+    avg_rating = (sum(ratings) / len(ratings)) if ratings else None
+
+    parts = []
+    if logo_url:
+        parts.append(f'<img src="{escape_html(logo_url)}" alt="{escape_html(display_name)}" style="max-height: 120px; margin-bottom: 2rem;">')
+    parts.append(f"<p>{escape_html(desc)}</p>")
+
+    facts = []
+    if service_titles:
+        facts.append(f"<strong>Services offered:</strong> {len(service_titles)}")
+    if avg_rating is not None:
+        stars = "★" * int(round(avg_rating)) + "☆" * (5 - int(round(avg_rating)))
+        facts.append(f"<strong>Average rating:</strong> {avg_rating:.1f} {stars}")
+    if service_areas:
+        facts.append(f"<strong>Service areas:</strong> {escape_html(', '.join(sorted(list(service_areas))[:10]))}")
+    if phone:
+        facts.append(f"<strong>Phone:</strong> {escape_html(phone)}")
+    if email:
+        facts.append(f'<strong>Email:</strong> <a href="mailto:{escape_html(email)}">{escape_html(email)}</a>')
+
+    if facts:
+        parts.append('<div class="card"><h2>Facts at a Glance</h2><ul>' + "".join(f"<li>{row}</li>" for row in facts) + "</ul></div>")
+
+    website = _first_nonempty(org.get("website"), org.get("url"), org_meta.get("website"))
+    same_as = _as_list(org.get("sameAs") or org.get("same_as"))
+    if website or same_as:
+        links = []
+        if website:
+            links.append(f'<li><a href="{escape_html(website)}" target="_blank" rel="nofollow">Website</a></li>')
+        for s in same_as[:12]:
+            links.append(f'<li><a href="{escape_html(s)}" target="_blank" rel="nofollow">{escape_html(s)}</a></li>')
+        parts.append("<h2>Links</h2><ul>" + "".join(links) + "</ul>")
+
+    parts.append("""
+    <div class="card">
+        <h2>Ready to Talk?</h2>
+        <p>Have a project in mind or need guidance? We’re here to help.</p>
+        <p><a href="contact.html">Contact us</a> to get started.</p>
+    </div>
+    """)
+
+    with open("about.html", "w", encoding="utf-8") as f:
+        f.write(generate_page(display_name, "\n".join(parts)))
+
+    print("✅ about.html generated")
+    return True
+
+def _map_embed_src(loc, address):
+    lat = loc.get("latitude") or (loc.get("geo") or {}).get("latitude")
+    lng = loc.get("longitude") or (loc.get("geo") or {}).get("longitude")
+    if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+        return f"https://www.google.com/maps?q={lat},{lng}&z=15&output=embed"
+    map_url = _first_nonempty(loc.get("map_embed_url"), loc.get("map"), loc.get("map_iframe"))
+    gmaps = _first_nonempty(loc.get("google_maps_url"), loc.get("maps_url"), loc.get("map_url"))
+    if map_url:
+        return map_url
+    if gmaps:
+        return gmaps
+    if address:
+        return f"https://www.google.com/maps?q={quote_plus(address)}&output=embed"
+    return ""
+
+def _format_address(loc):
+    addr = loc.get("address")
+    if isinstance(addr, str) and addr.strip():
+        return addr.strip()
+    if isinstance(addr, dict):
+        line1 = _first_nonempty(addr.get("streetAddress"), addr.get("address1"), addr.get("addressLine1"))
+        line2 = _first_nonempty(addr.get("address2"), addr.get("addressLine2"), addr.get("suite"))
+        city  = _first_nonempty(addr.get("addressLocality"), addr.get("city"))
+        state = _first_nonempty(addr.get("addressRegion"), addr.get("state"))
+        zipc  = _first_nonempty(addr.get("postalCode"), addr.get("zip"), addr.get("zipCode"))
+        parts = [line1, line2, ", ".join([p for p in [city, state] if p]) if city or state else None, zipc]
+        return " ".join([p for p in parts if p]).strip()
+    # component fallback
+    line1 = _first_nonempty(loc.get("address_street"), loc.get("streetAddress"), loc.get("street"))
+    line2 = _first_nonempty(loc.get("address2"), loc.get("suite"))
+    city  = _first_nonempty(loc.get("address_city"), loc.get("city"))
+    state = _first_nonempty(loc.get("address_state"), loc.get("state"), loc.get("addressRegion"))
+    zipc  = _first_nonempty(loc.get("address_postal_code"), loc.get("postalCode"), loc.get("zip"))
+    parts = [line1, line2, ", ".join([p for p in [city, state] if p]) if city or state else None, zipc]
+    return " ".join([p for p in parts if p]).strip()
+
+def _extract_hours(loc):
+    hours = _first_nonempty(loc.get("hours"), loc.get("openingHours"), loc.get("opening_hours"), loc.get("business_hours"))
+    if hours:
+        return hours
+    spec = loc.get("openingHoursSpecification") or loc.get("opening_hours_specification")
+    if isinstance(spec, list) and spec:
+        rows = []
+        for r in spec:
+            if not isinstance(r, dict):
+                continue
+            day = _first_nonempty(r.get("dayOfWeek"), r.get("day"), r.get("weekday"))
+            if isinstance(day, list) and day:
+                day = day[0]
+            if isinstance(day, str) and "/" in day:
+                day = day.rsplit("/", 1)[-1]
+            opens = _first_nonempty(r.get("opens"), r.get("openingTime"))
+            closes = _first_nonempty(r.get("closes"), r.get("closingTime"))
+            if day and (opens or closes):
+                rows.append(f"{day}: {opens or '—'} – {closes or '—'}")
+        if rows:
+            return "; ".join(rows)
+    return ""
+
 def generate_contact_page():
     """
-    Builds contact.html from schemas/locations/*.{json,yaml,yml}
-    Always renders a top 'Quick Contact' card (name/email/phone) from the first location,
-    then renders full location card(s) below.
+    Renders contact.html from locations folder.
+    Phone/Email appear ONLY in the top Quick Contact card (prevents duplicates under every map).
     """
-    locations_dir = "schemas/locations"
-    print(f"🔍 Checking contact data in: {locations_dir}")
-    if not os.path.exists(locations_dir):
-        print(f"❌ Locations directory not found: {locations_dir} — writing placeholder contact.html")
-        return _write_placeholder_page("contact.html", "Contact Us", "Contact details are not available yet.")
-
-    def _extract_contact(loc):
-        phone = _first_nonempty(_alias_get(loc, "phone"))
-        email = _first_nonempty(_alias_get(loc, "email"))
-        return phone, email
-
-    def _extract_site_and_social(loc):
-        website = _first_nonempty(_alias_get(loc, "website"))
-        socials = _as_list(_alias_get(loc, "sameAs"))
-        return website, socials
+    if not LOCATIONS_DIR:
+        with open("contact.html", "w", encoding="utf-8") as f:
+            f.write(generate_page("Contact Us", placeholder("Contact Us", "No locations folder found yet. Add location JSON/YAML files to your locations folder (or schemas/locations) to populate this page.")))
+        print("✅ contact.html generated (placeholder)")
+        return True
 
     items = []
-    files_seen = records_seen = rendered = 0
     first_name = ""
     first_phone = ""
     first_email = ""
 
-    for fname in sorted(os.listdir(locations_dir)):
+    files_seen = records_seen = 0
+
+    for fname in sorted(os.listdir(LOCATIONS_DIR)):
         if not fname.lower().endswith((".json", ".yaml", ".yml")):
             continue
         files_seen += 1
-        path = os.path.join(locations_dir, fname)
-        data = load_data(path)
+        data = load_data(os.path.join(LOCATIONS_DIR, fname))
         if not data:
             continue
 
@@ -447,15 +550,16 @@ def generate_contact_page():
                 continue
             records_seen += 1
 
-            name   = _first_nonempty(_alias_get(loc, "entity_name"), loc.get("location_name"), "Location")
-            person = _first_nonempty(_alias_get(loc, "contact_person"))
-            phone, email = _extract_contact(loc)
-            addr   = _format_address(loc.get("address"), loc)
-            hours  = _extract_hours(loc)
-            site, socials = _extract_site_and_social(loc)
+            name = _first_nonempty(loc.get("entity_name"), loc.get("location_name"), loc.get("name"), "Location")
+            phone = _first_nonempty(loc.get("phone"), loc.get("telephone"), (loc.get("contactPoint") or {}).get("telephone"))
+            email = _first_nonempty(loc.get("email"), (loc.get("contactPoint") or {}).get("email"))
+            person = _first_nonempty(loc.get("contact_person"), loc.get("contact"), loc.get("contact_name"))
+            addr = _format_address(loc)
+            hours = _extract_hours(loc)
+            site = _first_nonempty(loc.get("website"), loc.get("url"), loc.get("homepage"))
+            socials = _as_list(loc.get("sameAs") or loc.get("same_as") or loc.get("social") or loc.get("social_links"))
             map_src = _map_embed_src(loc, addr)
 
-            # Capture for Quick Contact (first record only)
             if not first_name:
                 first_name = name or ""
             if not first_phone and phone:
@@ -463,14 +567,12 @@ def generate_contact_page():
             if not first_email and email:
                 first_email = email
 
-            block = f"<div class='card'>"
+            block = "<div class='card'>"
             block += f"<h3>{escape_html(name)}</h3><p>"
             if person:
                 block += f"<strong>Contact:</strong> {escape_html(person)}<br>"
             if addr:
                 block += f"<strong>Address:</strong> {escape_html(addr)}<br>"
-            # Phone/Email are shown in the Quick Contact card above to avoid duplicates
-            # (and to keep each location card focused on address/hours/map).
             if hours:
                 block += f"<strong>Hours:</strong> {escape_html(hours)}<br>"
             if site:
@@ -489,76 +591,45 @@ def generate_contact_page():
                             style="border:0; border-radius: 8px;" allowfullscreen loading="lazy"></iframe>
                 </div>
                 """
-
             block += "</div>"
             items.append(block)
-            rendered += 1
 
-    if not items:
-        print(f"⚠️ No usable contact info found (scanned {files_seen} files, {records_seen} records). Writing placeholder contact.html")
-        return _write_placeholder_page("contact.html", "Contact Us", "Contact details are not available yet.")
-
-    # Intro + ALWAYS show Quick Contact (name + email + phone) from first record
     intro = "<p>We’d love to hear from you. Reach out using the details below or visit us at our offices.</p>"
-    if first_name or first_phone or first_email:
-        intro += "<div class='card'><h2>Quick Contact</h2>"
-        if first_name:
-            intro += f"<p><strong>{escape_html(first_name)}</strong></p>"
-        if first_phone:
-            intro += f"<p><strong>Phone:</strong> <a href='tel:{escape_html(first_phone)}'>{escape_html(first_phone)}</a></p>"
-        if first_email:
-            intro += f"<p><strong>Email:</strong> <a href='mailto:{escape_html(first_email)}'>{escape_html(first_email)}</a></p>"
-        intro += "</div>"
 
-    content = intro + "".join(items)
+    # Always show Quick Contact if we have it
+    quick = ""
+    if first_name or first_phone or first_email:
+        quick += "<div class='card'><h2>Quick Contact</h2>"
+        if first_name:
+            quick += f"<p><strong>{escape_html(first_name)}</strong></p>"
+        if first_phone:
+            quick += f"<p><strong>Phone:</strong> <a href='tel:{escape_html(first_phone)}'>{escape_html(first_phone)}</a></p>"
+        if first_email:
+            quick += f"<p><strong>Email:</strong> <a href='mailto:{escape_html(first_email)}'>{escape_html(first_email)}</a></p>"
+        quick += "</div>"
+
+    content = intro + quick + ("".join(items) if items else placeholder("Locations", f"No usable locations found (scanned {files_seen} files, {records_seen} records)."))
+
     with open("contact.html", "w", encoding="utf-8") as f:
         f.write(generate_page("Contact Us", content))
 
-    print(f"✅ contact.html generated — {rendered} location card(s) from {files_seen} file(s), {records_seen} record(s)")
+    print("✅ contact.html generated")
     return True
 
 def generate_services_page():
-    services_dir = "schemas/services"
-    print(f"🔍 Checking services data in: {services_dir}")
-    if not os.path.exists(services_dir):
-        print(f"❌ Services directory not found: {services_dir} — writing placeholder services.html")
-        return _write_placeholder_page("services.html", "Our Services", "No services have been published yet.")
-
-    def _guess_title(obj, filename):
-        candidate = _first_nonempty(
-            obj.get("title"),
-            obj.get("service_name"),
-            obj.get("name"),
-            obj.get("headline"),
-            obj.get("service"),
-            obj.get("offering"),
-            obj.get("product_name"),
-            obj.get("category"),
-            obj.get("subtype"),
-            obj.get("type"),
-            obj.get("label"),
-        )
-        if _is_placeholder_title(candidate):
-            kws = _as_list(obj.get("keywords"))
-            if kws:
-                candidate = " / ".join(kws[:2]).title()
-        if _is_placeholder_title(candidate):
-            candidate = _title_from_filename(filename)
-        return candidate
+    if not SERVICES_DIR:
+        with open("services.html", "w", encoding="utf-8") as f:
+            f.write(generate_page("Our Services", placeholder("Our Services", "No services folder found yet. Add JSON/YAML files to schemas/services (or services/) to populate this page.")))
+        print("✅ services.html generated (placeholder)")
+        return True
 
     items = []
-    files_processed = 0
-    placeholders_fixed = 0
-
-    for file in sorted(os.listdir(services_dir)):
-        if not file.endswith((".json", ".yaml", ".yml")):
+    for fn in sorted(os.listdir(SERVICES_DIR)):
+        if not fn.lower().endswith((".json", ".yaml", ".yml")):
             continue
-        filepath = os.path.join(services_dir, file)
-        data = load_data(filepath)
+        data = load_data(os.path.join(SERVICES_DIR, fn))
         if not data:
             continue
-        files_processed += 1
-
         records = data if isinstance(data, list) else [data]
         expanded = []
         for rec in records:
@@ -570,11 +641,14 @@ def generate_services_page():
         for svc in expanded:
             if not isinstance(svc, dict):
                 continue
-
-            title_before = _first_nonempty(svc.get("title"), svc.get("service_name"), svc.get("name"))
-            title = _guess_title(svc, filepath)
-            if _is_placeholder_title(title_before) and not _is_placeholder_title(title):
-                placeholders_fixed += 1
+            title_candidate = _first_nonempty(svc.get("title"), svc.get("service_name"), svc.get("name"))
+            title = title_candidate
+            if _is_placeholder_title(title):
+                kws = _as_list(svc.get("keywords"))
+                if kws:
+                    title = " / ".join(kws[:2]).title()
+            if _is_placeholder_title(title):
+                title = _title_from_filename(fn)
 
             description = _guess_description(svc) or ""
             price = _guess_price(svc)
@@ -582,10 +656,7 @@ def generate_services_page():
             slug = svc.get("slug") or slugify(title)
             badge = '<span class="badge">Featured</span>' if featured else ''
             bullets = _bullet_points(svc)
-
-            bullet_html = ""
-            if bullets:
-                bullet_html = "<ul>" + "".join(f"<li>{escape_html(b)}</li>" for b in bullets) + "</ul>"
+            bullet_html = "<ul>" + "".join(f"<li>{escape_html(b)}</li>" for b in bullets) + "</ul>" if bullets else ""
 
             items.append(f"""
             <div class="card" id="{escape_html(slug)}">
@@ -597,319 +668,197 @@ def generate_services_page():
             </div>
             """)
 
-    if not items:
-        print("⚠️ No valid services found — writing placeholder services.html")
-        return _write_placeholder_page("services.html", "Our Services", "No services have been published yet.")
-
+    content = "".join(items) if items else placeholder("Our Services", "No usable services found yet.")
     with open("services.html", "w", encoding="utf-8") as f:
-        f.write(generate_page("Our Services", "".join(items)))
+        f.write(generate_page("Our Services", content))
+    print("✅ services.html generated")
+    return True
 
-    if placeholders_fixed:
-        print(f"✨ Polished {placeholders_fixed} placeholder service title(s).")
-    print(f"✅ services.html generated ({len(items)} services from {files_processed} file(s))")
+def generate_awards_page():
+    awards_dir = "schemas/awards"
+    print(f"🔍 Checking awards data in: {awards_dir}")
+    if not os.path.exists(awards_dir):
+        print(f"❌ Awards directory not found: {awards_dir} — generating placeholder awards.html")
+        with open("awards.html", "w", encoding="utf-8") as f:
+            f.write(generate_page("Awards", "<p>No awards have been published yet.</p>"))
+        return True
+
+    def _guess_title(obj, filename):
+        candidate = _first_nonempty(
+            obj.get("title"),
+            obj.get("award_name"),
+            obj.get("certification_name"),
+            obj.get("accreditation_name"),
+            obj.get("license_name"),
+            obj.get("name"),
+            obj.get("issuer"),
+            obj.get("organization"),
+        )
+        if _is_placeholder_title(candidate):
+            candidate = _title_from_filename(filename)
+        return candidate
+
+    items = []
+    files_processed = 0
+
+    for file in sorted(os.listdir(awards_dir)):
+        if not file.endswith((".json", ".yaml", ".yml")):
+            continue
+        filepath = os.path.join(awards_dir, file)
+        data = load_data(filepath)
+        if not data:
+            continue
+        files_processed += 1
+
+        records = data if isinstance(data, list) else [data]
+        for aw in records:
+            if not isinstance(aw, dict):
+                continue
+            title = _guess_title(aw, filepath)
+            desc = _first_nonempty(aw.get("description"), aw.get("summary"), aw.get("details"), aw.get("notes"))
+            date = _first_nonempty(aw.get("date"), aw.get("awarded_date"), aw.get("year"))
+            org = _first_nonempty(aw.get("issuer"), aw.get("awarding_body"), aw.get("organization"))
+            extra = []
+            if date:
+                extra.append(f"<strong>Date:</strong> {escape_html(date)}")
+            if org:
+                extra.append(f"<strong>Issuer:</strong> {escape_html(org)}")
+            extra_html = "<br>".join(extra)
+
+            items.append(f"""
+            <div class="card">
+                <h2>{escape_html(title)}</h2>
+                {f"<p>{escape_html(desc)}</p>" if desc else ""}
+                {f"<p>{extra_html}</p>" if extra_html else ""}
+            </div>
+            """)
+
+    if not items:
+        content = "<p>No awards have been published yet.</p>"
+    else:
+        content = "".join(items)
+
+    with open("awards.html", "w", encoding="utf-8") as f:
+        f.write(generate_page("Awards", content))
+
+    print(f"✅ awards.html generated ({len(items)} items from {files_processed} file(s))")
     return True
 
 def generate_testimonials_page():
-    reviews_dir = "schemas/reviews"
-    print(f"🔍 Checking testimonials data in: {reviews_dir}")
-    if not os.path.exists(reviews_dir):
-        print(f"❌ Reviews directory not found: {reviews_dir} — writing placeholder testimonials.html")
-        return _write_placeholder_page("testimonials.html", "Testimonials", "No testimonials have been published yet.")
+    """
+    Testimonials page is built from the reviews folder.
+    Folder can be schemas/reviews OR reviews/ OR testimonials/
+    """
+    if not REVIEWS_DIR:
+        with open("testimonials.html", "w", encoding="utf-8") as f:
+            f.write(generate_page("Testimonials", placeholder("Testimonials", "No reviews folder found yet. Add JSON/YAML files to schemas/reviews (or reviews/) to populate this page.")))
+        print("✅ testimonials.html generated (placeholder)")
+        return True
 
     items = []
-    for file in os.listdir(reviews_dir):
-        if file.endswith((".json", ".yaml", ".yml")):
-            filepath = os.path.join(reviews_dir, file)
-            rev_data = load_data(filepath)
-            if not rev_data:
+    for fn in sorted(os.listdir(REVIEWS_DIR)):
+        if not fn.lower().endswith((".json", ".yaml", ".yml")):
+            continue
+        data = load_data(os.path.join(REVIEWS_DIR, fn))
+        if not data:
+            continue
+        for rev in (data if isinstance(data, list) else [data]):
+            if not isinstance(rev, dict):
                 continue
-            for rev in (rev_data if isinstance(rev_data, list) else [rev_data]):
-                author = rev.get('customer_name') or rev.get('author') or 'Anonymous'
-                entity = rev.get('entity_name') or ''
-                quote = rev.get('review_body') or rev.get('quote') or rev.get('review_title') or 'No review text provided.'
-                rating = int(rev.get('rating', 5))
-                date = rev.get('date') or ''
-                star_display = '★' * rating + '☆' * (5 - rating)
-                items.append(f"""
-                <blockquote class="card" style="font-style: italic;">
-                    <p>“{escape_html(quote)}”</p>
-                    <footer style="margin-top: 1rem; font-style: normal;">
-                        — {escape_html(author)}{f', {escape_html(entity)}' if entity else ''}
-                        {f'<br/><small>{escape_html(date)}</small>' if date else ''}
-                    </footer>
-                    <div style="margin-top: 0.5rem; color: #f39c12;">{star_display}</div>
-                </blockquote>
-                """)
+            author = _first_nonempty(rev.get("customer_name"), rev.get("author"), "Anonymous")
+            entity = _first_nonempty(rev.get("entity_name"), "")
+            quote = _first_nonempty(rev.get("review_body"), rev.get("quote"), rev.get("review_title"), "No review text provided.")
+            try:
+                rating = int(float(rev.get("rating", 5)))
+            except Exception:
+                rating = 5
+            rating = max(1, min(5, rating))
+            date = _first_nonempty(rev.get("date"), "")
+            star_display = "★" * rating + "☆" * (5 - rating)
+            items.append(f"""
+            <blockquote class="card" style="font-style: italic;">
+                <p>“{escape_html(quote)}”</p>
+                <footer style="margin-top: 1rem; font-style: normal;">
+                    — {escape_html(author)}{f', {escape_html(entity)}' if entity else ''}
+                    {f'<br/><small>{escape_html(date)}</small>' if date else ''}
+                </footer>
+                <div style="margin-top: 0.5rem; color: #f39c12;">{star_display}</div>
+            </blockquote>
+            """)
 
-    if not items:
-        print("⚠️ No valid testimonials found — writing placeholder testimonials.html")
-        return _write_placeholder_page("testimonials.html", "Testimonials", "No testimonials have been published yet.")
-
+    content = "".join(items) if items else placeholder("Testimonials", "No usable reviews found yet.")
     with open("testimonials.html", "w", encoding="utf-8") as f:
-        f.write(generate_page("Testimonials", "".join(items)))
-    print(f"✅ testimonials.html generated ({len(items)} testimonials)")
-    return True
-
-def generate_index_page():
-    """Home: show 'Welcome to {Entity}' in the visible H1 and keep <title> = '{Entity} — Welcome'."""
-    org = load_org_meta()
-    site_name = org.get("name") or "Site"
-
-    links = [
-        ("About Us", "about.html"),
-        ("Our Services", "services.html"),
-        ("Testimonials", "testimonials.html"),
-        ("FAQs", "faqs.html"),
-        ("Help Center", "help.html"),
-        ("Contact Us", "contact.html"),
-        ("Browse All Schema Files", "#files"),
-    ]
-    quick_links = "\n".join(
-        f'<li style="margin: 0.5rem 0;"><a href="{url}" style="font-size: 1.1em; font-weight: 500;">{escape_html(name)}</a></li>'
-        for name, url in links
-    )
-
-    file_links = []
-    repo_slug = os.getenv('GITHUB_REPOSITORY')
-    if not repo_slug:
-        print("❌ ERROR: GITHUB_REPOSITORY environment variable not set!")
-        sys.exit(1)
-
-    base_url = f"https://raw.githubusercontent.com/{repo_slug}/main"
-    print(f"🌐 Base URL for schema files: {base_url}")
-
-    for root, dirs, files in os.walk("schemas"):
-        for file in files:
-            if file.endswith((".json", ".yaml", ".yml", ".md", ".llm")):
-                filepath = os.path.join(root, file).replace("\\", "/")
-                full_url = f"{base_url}/{filepath}"
-                display_path = filepath.replace("schemas/", "")
-                file_links.append(f'<li><a href="{full_url}" target="_blank">{escape_html(display_path)}</a></li>')
-
-    content = f"""
-    <p>Welcome to our AI-optimized data hub. Below are quick links to key sections, or browse all machine-readable files.</p>
-    <h2>🚀 Quick Navigation</h2>
-    <ul style="list-style: none; padding: 0;">
-        {quick_links}
-    </ul>
-    <h2 id="files">📁 All Schema Files</h2>
-    <ul>
-        {''.join(sorted(file_links))}
-    </ul>
-    """
-
-    # Pass a visible header that includes the entity name.
-    with open("index.html", "w", encoding="utf-8") as f:
-        f.write(generate_page(f"Welcome to {site_name}", content))
-    print("✅ index.html generated")
-    return True
-
-def generate_about_page():
-    # Locate org file (if any)
-    candidate_dirs = [
-        "schemas/organization",
-        "schemas/organizations",
-        "schemas/company",
-        "schemas/entity",
-        "schemas/business",
-    ]
-    org_dir = next((d for d in candidate_dirs if os.path.isdir(d)), None)
-
-    org = None
-    picked_path = None
-    if org_dir:
-        cand = [f for f in os.listdir(org_dir) if f.endswith(('.json', '.yaml', '.yml'))]
-        if cand:
-            picked_path = os.path.join(org_dir, cand[0])
-            data = load_data(picked_path)
-            if data:
-                org = data[0] if isinstance(data, list) else data
-
-    # Gather summary from other schemas
-    services_dir = "schemas/services"
-    locations_dir = "schemas/locations"
-    reviews_dir = "schemas/reviews"
-
-    # Count services
-    service_titles = []
-    if os.path.isdir(services_dir):
-        for file in os.listdir(services_dir):
-            if not file.endswith((".json", ".yaml", ".yml")):
-                continue
-            for rec in (load_data(os.path.join(services_dir, file)) or []):
-                if isinstance(rec, dict) and isinstance(rec.get("services"), list):
-                    for s in rec["services"]:
-                        if isinstance(s, dict):
-                            title = _first_nonempty(s.get("title"), s.get("service_name"), s.get("name"))
-                            if _is_placeholder_title(title):
-                                title = None
-                            service_titles.append(title or _title_from_filename(file))
-                elif isinstance(rec, dict):
-                    title = _first_nonempty(rec.get("title"), rec.get("service_name"), rec.get("name"))
-                    if _is_placeholder_title(title):
-                        title = None
-                    service_titles.append(title or _title_from_filename(file))
-    service_count = len(service_titles)
-
-    # Locations / service areas
-    service_areas = set()
-    phone = email = ""
-    if os.path.isdir(locations_dir):
-        for file in os.listdir(locations_dir):
-            if not file.endswith((".json", ".yaml", ".yml")):
-                continue
-            for loc in (load_data(os.path.join(locations_dir, file)) or []):
-                if not isinstance(loc, dict):
-                    continue
-                for area in _as_list(loc.get("service_areas") or loc.get("areas")):
-                    service_areas.add(area)
-                if not phone:
-                    phone = _first_nonempty(_alias_get(loc, "phone"))
-                if not email:
-                    email = _first_nonempty(_alias_get(loc, "email"))
-
-    # Reviews: average rating
-    ratings = []
-    if os.path.isdir(reviews_dir):
-        for file in os.listdir(reviews_dir):
-            if not file.endswith((".json", ".yaml", ".yml")):
-                continue
-            for rev in (load_data(os.path.join(reviews_dir, file)) or []):
-                if isinstance(rev, dict):
-                    try:
-                        r = float(rev.get("rating"))
-                        if r > 0:
-                            ratings.append(r)
-                    except Exception:
-                        pass
-    avg_rating = (sum(ratings) / len(ratings)) if ratings else None
-
-    # Build an org fallback if missing
-    if not org:
-        repo_slug = os.getenv("GITHUB_REPOSITORY") or ""
-        fallback_name = repo_slug.split("/", 1)[-1].replace("-", " ").title() if repo_slug else "Our Company"
-        org = {
-            "entity_name": fallback_name,
-            "name": fallback_name,
-            "description": "",
-            "mission": "",
-            "vision": "",
-            "logo_url": "",
-            "website": "",
-        }
-
-    # Compose page
-    parts = []
-    display_name = _first_nonempty(org.get("entity_name"), org.get("name")) or "About Us"
-    logo_url = _first_nonempty(org.get("logo_url"), org.get("logo"))
-    if logo_url:
-        parts.append(f'<img src="{escape_html(logo_url)}" alt="{escape_html(display_name)}" style="max-height: 120px; margin-bottom: 2rem;">')
-
-    desc = _first_nonempty(org.get("description"))
-    if not desc:
-        desc = f"{display_name} is a professional firm serving our community with high-quality services and a client-first approach."
-    parts.append(f"<p>{escape_html(desc)}</p>")
-
-    facts = []
-    facts.append(f"<strong>Services offered:</strong> {service_count}")
-    if avg_rating is not None:
-        stars = "★" * int(round(avg_rating)) + "☆" * (5 - int(round(avg_rating)))
-        facts.append(f"<strong>Average rating:</strong> {avg_rating:.1f} {stars}")
-    if service_areas:
-        facts.append(f"<strong>Service areas:</strong> {escape_html(', '.join(sorted(list(service_areas))[:8]))}")
-    if phone:
-        facts.append(f"<strong>Phone:</strong> {escape_html(phone)}")
-    if email:
-        facts.append(f'<strong>Email:</strong> <a href="mailto:{escape_html(email)}">{escape_html(email)}</a>')
-
-    parts.append('<div class="card"><h2>Facts at a Glance</h2><ul>' +
-                 "".join(f"<li>{row}</li>" for row in facts) + "</ul></div>")
-
-    if org.get("mission"):
-        parts.append(f"<h2>Our Mission</h2><p>{escape_html(org.get('mission'))}</p>")
-    if org.get("vision"):
-        parts.append(f"<h2>Our Vision</h2><p>{escape_html(org.get('vision'))}</p>")
-
-    website = _first_nonempty(org.get("website"), org.get("url"))
-    same_as = _as_list(org.get("sameAs") or org.get("same_as"))
-    if website or same_as:
-        links = []
-        if website:
-            links.append(f'<li><a href="{escape_html(website)}" target="_blank" rel="nofollow">Website</a></li>')
-        for s in same_as[:12]:
-            links.append(f'<li><a href="{escape_html(s)}" target="_blank" rel="nofollow">{escape_html(s)}</a></li>')
-        parts.append("<h2>Links</h2><ul>" + "".join(links) + "</ul>")
-
-    parts.append(f"""
-    <div class="card">
-        <h2>Ready to Talk?</h2>
-        <p>Have a project in mind or need guidance? We’re here to help.</p>
-        <p><a href="contact.html">Contact us</a> to get started.</p>
-    </div>
-    """)
-
-    with open("about.html", "w", encoding="utf-8") as f:
-        f.write(generate_page(display_name, "\n".join(parts)))
-
-    if picked_path:
-        print(f"✅ about.html generated from {picked_path}")
-    else:
-        print("✅ about.html generated from synthesized data")
+        f.write(generate_page("Testimonials", content))
+    print("✅ testimonials.html generated")
     return True
 
 def generate_faq_page():
-    faq_dir = "schemas/faqs"
-    print(f"🔍 Checking FAQs in: {faq_dir}")
-    if not os.path.exists(faq_dir):
-        print(f"❌ FAQ directory not found: {faq_dir} — writing placeholder faqs.html")
-        return _write_placeholder_page("faqs.html", "Frequently Asked Questions", "No FAQs have been published yet.")
+    if not FAQ_DIR:
+        with open("faqs.html", "w", encoding="utf-8") as f:
+            f.write(generate_page("Frequently Asked Questions", placeholder("FAQs", "No FAQ folder found yet. Add JSON/YAML files to schemas/faqs (or faq-schemas/) to populate this page.")))
+        print("✅ faqs.html generated (placeholder)")
+        return True
 
     items = []
-    for file in os.listdir(faq_dir):
-        if file.endswith((".json", ".yaml", ".yml")):
-            filepath = os.path.join(faq_dir, file)
-            faq_data = load_data(filepath)
-            if not faq_data:
+    for fn in sorted(os.listdir(FAQ_DIR)):
+        if not fn.lower().endswith((".json", ".yaml", ".yml")):
+            continue
+        data = load_data(os.path.join(FAQ_DIR, fn))
+        if not data:
+            continue
+        for item in (data if isinstance(data, list) else [data]):
+            if not isinstance(item, dict):
                 continue
-            for item in (faq_data if isinstance(faq_data, list) else [faq_data]):
-                question = (item.get('question') or '').strip()
-                answer = (item.get('answer') or '').strip()
-                if not question:
-                    continue
-                items.append(f"""
-                <div class="card">
-                    <h3 style="margin: 0 0 0.5rem 0;">{escape_html(question)}</h3>
-                    <p>{escape_html(answer)}</p>
-                </div>
-                """)
+            question = (item.get("question") or "").strip()
+            answer = (item.get("answer") or "").strip()
+            if not question:
+                continue
+            items.append(f"""
+            <div class="card">
+                <h3 style="margin: 0 0 0.5rem 0;">{escape_html(question)}</h3>
+                <p>{escape_html(answer)}</p>
+            </div>
+            """)
 
-    if not items:
-        print("⚠️ No valid FAQs found — writing placeholder faqs.html")
-        return _write_placeholder_page("faqs.html", "Frequently Asked Questions", "No FAQs have been published yet.")
-
+    content = "".join(items) if items else placeholder("FAQs", "No usable FAQs found yet.")
     with open("faqs.html", "w", encoding="utf-8") as f:
-        f.write(generate_page("Frequently Asked Questions", "".join(items)))
-    print(f"✅ faqs.html generated ({len(items)} FAQs)")
+        f.write(generate_page("Frequently Asked Questions", content))
+    print("✅ faqs.html generated")
     return True
 
 def generate_help_articles_page():
-    help_dir = "schemas/help-articles"
-    print(f"🔍 Looking for help articles in: {help_dir}")
-    if not os.path.exists(help_dir):
-        print(f"❌ Folder not found: {help_dir} — writing placeholder help.html")
-        return _write_placeholder_page("help.html", "Help Center", "No help articles have been published yet.")
+    # help articles prefer HELP_DIR; if none, we can optionally render a directory listing of llm-data markdown
+    help_source = HELP_DIR
+    if not help_source and LLM_DATA_DIR and os.path.isdir(LLM_DATA_DIR):
+        # Only use markdown files within llm-data
+        md_files = [f for f in _list_data_files(LLM_DATA_DIR, exts=(".md",)) if f.lower().endswith(".md")]
+        if md_files:
+            help_source = LLM_DATA_DIR
 
-    files_found = [f for f in os.listdir(help_dir) if f.endswith(".md")]
-    print(f"📄 Found {len(files_found)} .md files: {files_found[:5]}")
+    if not help_source:
+        with open("help.html", "w", encoding="utf-8") as f:
+            f.write(generate_page("Help Center", placeholder("Help Center", "No help-articles folder found yet. Add .md files to schemas/help-articles (or help-articles/) to populate this page.")))
+        print("✅ help.html generated (placeholder)")
+        return True
 
-    if not files_found:
-        print("⚠️ No .md files found — writing placeholder help.html")
-        return _write_placeholder_page("help.html", "Help Center", "No help articles have been published yet.")
+    # Collect markdown files
+    md_files = []
+    if os.path.isdir(help_source):
+        for root, _, files in os.walk(help_source):
+            for fn in files:
+                if fn.lower().endswith(".md"):
+                    md_files.append(os.path.join(root, fn))
+    md_files = sorted(md_files)
+
+    if not md_files:
+        with open("help.html", "w", encoding="utf-8") as f:
+            f.write(generate_page("Help Center", placeholder("Help Center", "No .md help articles found yet.")))
+        print("✅ help.html generated (placeholder)")
+        return True
 
     articles = []
-    for file in files_found:
-        filepath = os.path.join(help_dir, file)
-        with open(filepath, 'r', encoding='utf-8') as f:
+    for filepath in md_files:
+        with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
 
         title = None
@@ -919,10 +868,8 @@ def generate_help_articles_page():
 
         for line in content.splitlines():
             if line.strip() == "---" and not frontmatter_done:
+                in_frontmatter = not in_frontmatter
                 if not in_frontmatter:
-                    in_frontmatter = True
-                else:
-                    in_frontmatter = False
                     frontmatter_done = True
                 continue
 
@@ -933,7 +880,7 @@ def generate_help_articles_page():
                 body_lines.append(line)
 
         if not title:
-            title = file.replace(".md", "").replace("-", " ").title()
+            title = _title_from_filename(filepath)
 
         html_lines = []
         for line in body_lines:
@@ -948,78 +895,75 @@ def generate_help_articles_page():
             else:
                 html_lines.append(f"<p>{escape_html(line)}</p>")
 
-        article_html = f"""
+        articles.append(f"""
         <div class="card">
             <h2>{escape_html(title)}</h2>
             {''.join(html_lines)}
         </div>
-        """
-        articles.append(article_html)
+        """)
 
     with open("help.html", "w", encoding="utf-8") as f:
         f.write(generate_page("Help Center", "".join(articles)))
-    print(f"✅ help.html generated ({len(articles)} articles)")
+    print("✅ help.html generated")
     return True
 
-# =========================
+# -------------------------
 # Entry point
-# =========================
+# -------------------------
 def find_repo_root():
-    """Find a directory that contains 'schemas' by walking up from script dir."""
+    """Find a directory that contains any of the expected content folders."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cur = script_dir
-    for _ in range(4):
-        if os.path.isdir(os.path.join(cur, "schemas")):
+    markers = ["schemas", "faq-schemas", "organization", "locations", "llm-data"]
+    for _ in range(5):
+        if any(os.path.isdir(os.path.join(cur, m)) for m in markers):
             return cur
         parent = os.path.dirname(cur)
         if parent == cur:
             break
         cur = parent
-    return script_dir  # fallback
+    return script_dir
 
 if __name__ == "__main__":
-    print("🚀 STARTING build_public_pages.py — GENERIC VERSION FOR ANY REPO")
+    print("🚀 STARTING build_public_pages.py — FLEXIBLE VERSION")
 
     REPO_ROOT = find_repo_root()
     os.chdir(REPO_ROOT)
     print(f"✅ WORKING DIRECTORY SET TO: {REPO_ROOT}")
 
-    if not os.path.exists("schemas"):
-        print("❌ FATAL: schemas/ folder not found at repo root")
-        sys.exit(1)
-    else:
-        print(f"📁 schemas/ contents: {os.listdir('schemas')[:10]}")
-
+    # Ensure GitHub Pages does not use Jekyll
     open(".nojekyll", "w").close()
     print("✅ Created .nojekyll file for GitHub Pages")
 
-    html_files = ["index.html", "about.html", "services.html", "testimonials.html", "faqs.html", "help.html", "contact.html"]
+    # Force rebuild by deleting old html files (safe)
+    html_files = ["index.html", "about.html", "services.html", "awards.html", "testimonials.html", "faqs.html", "help.html", "contact.html"]
     for f in html_files:
         if os.path.exists(f):
             os.remove(f)
             print(f"🗑️ Deleted old {f} — forcing rebuild")
 
-    page_generators = [
+    # Always generate all pages (no exceptions / no sys.exit)
+    generators = [
         ("index.html", generate_index_page),
         ("about.html", generate_about_page),
         ("services.html", generate_services_page),
+        ("awards.html", generate_awards_page),
         ("testimonials.html", generate_testimonials_page),
         ("faqs.html", generate_faq_page),
         ("help.html", generate_help_articles_page),
         ("contact.html", generate_contact_page),
     ]
 
-    any_success = False
-    for filename, generator in page_generators:
+    ok = True
+    for filename, gen in generators:
         try:
-            success = generator()
-            if success:
-                print(f"✅ {filename} generated successfully")
-                any_success = True
+            gen()
         except Exception as e:
-            print(f"❌ {filename} generation failed: {e}")
+            ok = False
+            print(f"❌ Failed generating {filename}: {e}")
 
-    if not any_success:
-        print("⚠️ No pages generated — check your schemas/* folders and filenames")
-    else:
-        print("\n🎉 BUILD COMPLETE — site ready for GitHub Pages deployment")
+    if not ok:
+        print("⚠️ BUILD FINISHED WITH ERRORS — check logs above")
+        sys.exit(2)
+
+    print("\n🎉 BUILD COMPLETE — site ready for GitHub Pages deployment")
